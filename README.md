@@ -5,12 +5,6 @@ The service watches Mutter's `user.xdg.inactive-since` cgroup attribute and chan
 the application's `dmem.low` values. It restores the previous values when focus
 is lost or the service stops.
 
-This is an independent Rust project extracted from
-[dmemcg-booster](https://github.com/razzeee/dmemcg-booster), commit `aba1db5`.
-It has no source or Cargo workspace dependency on that project. The directory
-can be moved into its own repository. Derived code retains the original MIT
-license notice in [LICENSE](LICENSE).
-
 ## Requirements
 
 - Linux with cgroup v2 and a working dmem controller and driver.
@@ -23,10 +17,16 @@ license notice in [LICENSE](LICENSE).
 - Controller enablement and protection on ancestor cgroups, including
   `app.slice` and the user service hierarchy.
 
-Today, the system and user **dmemcg-booster** services supply controller and
-ancestor setup. This foreground service does not enable controllers or modify
-ancestor limits. Future systemd support must provide equivalent configuration
-before the shim can be removed.
+Run the system and user [dmemcg-booster](https://github.com/razzeee/dmemcg-booster)
+services to enable the controller and protect ancestor cgroups. This foreground
+service handles individual applications; it does not enable controllers or
+modify ancestor limits.
+
+The companion must retry unit notifications when systemd has not yet assigned
+`ControlGroup`. Without that retry, applications in a newly created nested slice
+can remain without dmem files. Use a version containing the
+[retry fix](https://github.com/razzeee/dmemcg-booster/pull/1), merged in
+`9eb57f977996a800c1ff5a60f1dde556b3d9ddeb`.
 
 Registration retries once per second when application dmem files are unavailable
 or unwritable. Missing focus attributes do not cause a boost. More than one
@@ -61,31 +61,9 @@ without `sudo`. Inspect its messages with:
 journalctl --user -u gnome-foreground-booster.service
 ```
 
-## Upgrade from the integrated foreground implementation
-
-The previous dmemcg-booster user binary also applied foreground protection. Stop
-it before starting this service:
-
-```sh
-systemctl --user stop dmemcg-booster-user.service
-```
-
-Install the simplified dmemcg-booster binary and the foreground binary and unit,
-then run:
-
-```sh
-systemctl --user daemon-reload
-systemctl --user start dmemcg-booster-user.service
-systemctl --user enable --now gnome-foreground-booster.service
-```
-
-Keep the system-level shim service enabled for privileged ancestor setup. Its
-next restart should also use the simplified binary.
-
 The foreground service claims `org.gnome.ForegroundBooster` on the user bus
 before changing limits. A second instance on the same bus exits with an error.
-The old integrated binary does not claim this name, so it must be stopped during
-the upgrade. Separate private session buses do not share this ownership check.
+Separate private session buses do not share this ownership check.
 
 ## Recovery state
 
@@ -95,10 +73,8 @@ After focus loss, it restores a value only if the current value still matches
 the recorded boost. Differing external writes are preserved, though these
 reads and writes are not an atomic transaction with other limit writers.
 
-The record uses `user.dmemcg-booster.dmem-low-state`, format `v1`. The historical
-name is intentional: the new service can recover records left by the integrated
-version without migrating or discarding original limits. These records support
-process crash and restart recovery and disappear with their cgroup.
+The record uses `user.dmemcg-booster.dmem-low-state`, format `v1`. It preserves
+original limits across process crashes and restarts and disappears with its cgroup.
 
 SIGINT, SIGTERM, and D-Bus processing failures trigger a restoration attempt.
 Failed cleanup retains the recovery record for retry or a replacement process.
@@ -117,6 +93,33 @@ cargo build --release --locked
 The ownership test is ignored in the normal run because it needs an isolated
 session bus. The other tests use fake I/O or temporary directories with real
 xattrs and inotify. They do not modify live cgroup limits.
+
+### Companion integration tests
+
+The integration suite runs both binaries, including the companion's system and
+user processes, against private D-Bus services and a simulated cgroup filesystem.
+Bubblewrap mounts the fixture over `/sys/fs/cgroup` in a separate mount namespace.
+It exercises startup order, focus changes, external limit writes, duplicate
+instances, crashes, D-Bus failure, cgroup recreation, and delayed unit setup.
+
+Install `bubblewrap`, `dbus`, `python3-dbus`, and `python3-gi` on Debian-based
+systems, and build both binaries. Then run:
+
+```sh
+/usr/bin/python3 tests/companion.py --companion /path/to/dmemcg-booster/target/release/dmemcg-booster
+```
+
+The test runner requires unprivileged user namespaces. Use the system Python so
+it can import the distribution's D-Bus and GLib modules. To run a single case,
+add `--test test_delayed_assignment_in_new_hierarchy`.
+
+[GitHub Actions](.github/workflows/ci.yml) runs formatting, unit tests, the
+isolated-bus ownership test, a release build, and the integration suite. CI builds
+the companion at `9eb57f977996a800c1ff5a60f1dde556b3d9ddeb` without local patches.
+The fixture simulates systemd notifications and controller file creation;
+the binaries' D-Bus calls, xattrs, inotify watches, and process signals are real.
+
+### Live GNOME check
 
 For a live GNOME check, record the original `dmem.low` values for two application
 cgroups, switch focus between them, and confirm the focused application's boost
