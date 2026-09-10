@@ -1,0 +1,13 @@
+[package]
+name = "gnome-foreground-booster"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Foreground device-memory protection using Mutter's cgroup focus attributes"
+
+[dependencies]
+dbus = "0.9.10"
+inotify = { version = "0.11.5", default-features = false }
+libc = "0.2.183"
+signal-hook = "0.3.18"
+xattr = "1.6.1"
