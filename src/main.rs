@@ -12,6 +12,7 @@ use dbus::blocking::stdintf::org_freedesktop_dbus::RequestNameReply;
 use dbus::channel::{BusType, Channel};
 
 mod cgroup;
+mod diagnostics;
 mod filesystem;
 mod foreground;
 mod recovery;
@@ -199,7 +200,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut channel = Channel::get_private(BusType::Session)?;
     channel.set_watch_enabled(true);
     let connection = Connection::from(channel);
-    claim_name(&connection)?;
 
     let new_unit_signal =
         dbus::message::MatchRule::new_signal("org.freedesktop.systemd1.Manager", "UnitNew");
@@ -247,10 +247,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     signal_hook::flag::register(signal_hook::consts::SIGTERM, terminated.clone())?;
     signal_hook::flag::register(signal_hook::consts::SIGINT, terminated.clone())?;
     let mut policy = ForegroundPolicy::new(PathBuf::from("/sys/fs/cgroup"))?;
+    let mut root = application_root(&connection);
+    policy.check_prerequisites(root.as_deref());
+
+    // Type=dbus considers the service started when this name is acquired.
+    // Initialize inotify and subscribe first, but never change limits before ownership.
+    claim_name(&connection)?;
 
     // Keep ownership until cleanup finishes, including when D-Bus processing fails.
     let result = (|| -> Result<(), dbus::Error> {
-        let mut root = application_root(&connection);
         if let Some(root) = &root {
             register_application_cgroups(root, &mut policy);
         }
@@ -277,6 +282,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if last_maintenance.elapsed() >= Duration::from_secs(1) {
                 // Re-resolve the root and discover recreated cgroups without UnitNew.
                 root = application_root(&connection);
+                policy.check_prerequisites(root.as_deref());
                 if let Some(root) = &root {
                     policy.restrict_to(root);
                     unit_cgroups.retain(|_, path| is_application_cgroup(root, path));
