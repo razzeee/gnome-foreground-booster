@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build and test with dmemcg-booster
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out foreground booster
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libdbus-1-dev pkg-config bubblewrap dbus python3-dbus python3-gi
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run unit tests
+        run: cargo test --locked
+
+      - name: Test single-instance ownership
+        run: >-
+          dbus-run-session -- cargo test --locked
+          tests::ownership_rejects_duplicates_and_is_released_on_disconnect
+          -- --ignored --exact
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Check out pinned companion
+        uses: actions/checkout@v4
+        with:
+          repository: razzeee/dmemcg-booster
+          ref: 9eb57f977996a800c1ff5a60f1dde556b3d9ddeb
+          path: target/companion
+          persist-credentials: false
+
+      - name: Build companion
+        run: cargo build --release --locked --manifest-path target/companion/Cargo.toml
+
+      - name: Test both services together
+        run: >-
+          /usr/bin/python3 tests/companion.py
+          --companion target/companion/target/release/dmemcg-booster

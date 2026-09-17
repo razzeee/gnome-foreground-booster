@@ -1,0 +1,13 @@
+[package]
+name = "gnome-foreground-booster"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "Device-memory protection for the focused application in GNOME"
+
+[dependencies]
+dbus = "0.9.10"
+inotify = { version = "0.11.5", default-features = false }
+libc = "0.2.183"
+signal-hook = { version = "0.3.18", default-features = false }
+xattr = "1.6.1"

@@ -1,0 +1,12 @@
+[Unit]
+Description=Device-memory protection for the focused application in GNOME
+PartOf=graphical-session.target
+After=dmemcg-booster-user.service
+
+[Service]
+ExecStart=/usr/bin/gnome-foreground-booster
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=graphical-session.target
