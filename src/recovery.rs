@@ -1,6 +1,7 @@
 //! Persist original limits before boosting, then restore or recover them.
 
 use crate::cgroup::{DmemValue, parse_dmem_values, valid_region};
+use crate::diagnostics::debug;
 use crate::foreground::ForegroundPolicy;
 use std::collections::BTreeMap;
 use std::io;
@@ -75,11 +76,19 @@ impl ForegroundPolicy {
             Ok(value) => match parse_dmem_values(&value) {
                 Ok(value) => value,
                 Err(error) => {
-                    eprintln!("WARNING: Could not parse root dmem.capacity: {error}");
+                    self.diagnostics.warn(
+                        "capacity",
+                        format_args!("Could not parse root dmem.capacity: {error}"),
+                    );
                     return;
                 }
             },
-            Err(_) => return,
+            Err(error) => {
+                self.diagnostics.warn("capacity", format_args!(
+                    "Cannot read root dmem.capacity: {error}; check the dmem controller and driver"
+                ));
+                return;
+            }
         };
         let low_path = path.join("dmem.low");
         let baseline = match self
@@ -114,6 +123,10 @@ impl ForegroundPolicy {
             }
         }
         if state.is_empty() {
+            debug(format_args!(
+                "No additional dmem.low values to apply for {}",
+                path.display()
+            ));
             self.pending_apply.remove(path);
             self.foreground = Some(path.to_path_buf());
             return;
@@ -150,6 +163,12 @@ impl ForegroundPolicy {
                 return;
             }
             written.push(region.clone());
+            debug(format_args!(
+                "Boosted {} region {region}: {} -> {}",
+                path.display(),
+                entry.baseline,
+                entry.applied
+            ));
         }
         self.foreground = Some(path.to_path_buf());
         self.pending_apply.remove(path);
@@ -210,6 +229,10 @@ impl ForegroundPolicy {
             .filter(|(region, entry)| current.get(region) == Some(&entry.applied))
             .collect();
         if candidates.is_empty() {
+            debug(format_args!(
+                "No boosted values remain on {}; preserving current limits",
+                path.display()
+            ));
             if let Err(error) = self.io.remove_xattr(path, STATE_XATTR) {
                 eprintln!(
                     "WARNING: Could not remove foreground state for {}: {error}",
@@ -233,12 +256,20 @@ impl ForegroundPolicy {
 
         let mut retry = RecoveryState::new();
         for (region, entry) in &candidates {
-            if self
-                .io
-                .write_dmem(&low_path, region, entry.baseline)
-                .is_err()
-            {
-                retry.insert(region.clone(), entry.clone());
+            match self.io.write_dmem(&low_path, region, entry.baseline) {
+                Ok(()) => debug(format_args!(
+                    "Restored {} region {region}: {} -> {}",
+                    path.display(),
+                    entry.applied,
+                    entry.baseline
+                )),
+                Err(error) => {
+                    self.diagnostics.warn("restore-write", format_args!(
+                        "Cannot restore {} region {region}: {error}; retaining recovery state for retry",
+                        path.display()
+                    ));
+                    retry.insert(region.clone(), entry.clone());
+                }
             }
         }
         let result = if retry.is_empty() {
@@ -311,6 +342,10 @@ impl ForegroundPolicy {
         }
         self.foreground = Some(path.to_path_buf());
         self.pending_apply.remove(path);
+        debug(format_args!(
+            "Recovered foreground state for {}",
+            path.display()
+        ));
         true
     }
 }

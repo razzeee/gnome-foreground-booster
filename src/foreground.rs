@@ -1,6 +1,7 @@
 //! Track application focus and schedule protection changes and retries.
 
 use crate::cgroup::{is_application_cgroup, parse_dmem_values};
+use crate::diagnostics::{Diagnostics, debug, inotify_error};
 use crate::filesystem::{PolicyIo, RealIo};
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -25,6 +26,7 @@ fn focus_is_active(value: &[u8]) -> Result<bool, &'static str> {
 pub struct ForegroundPolicy {
     pub(crate) root: PathBuf,
     pub(crate) io: Box<dyn PolicyIo>,
+    pub(crate) diagnostics: Diagnostics,
     inotify: Option<Inotify>,
     watches: HashMap<WatchDescriptor, PathBuf>,
     paths: HashMap<PathBuf, WatchDescriptor>,
@@ -42,7 +44,8 @@ impl ForegroundPolicy {
         Ok(Self {
             root,
             io: Box::new(RealIo),
-            inotify: Some(Inotify::init()?),
+            diagnostics: Diagnostics::default(),
+            inotify: Some(Inotify::init().map_err(inotify_error)?),
             watches: HashMap::new(),
             paths: HashMap::new(),
             pending_registration: HashSet::new(),
@@ -60,6 +63,7 @@ impl ForegroundPolicy {
         Self {
             root,
             io,
+            diagnostics: Diagnostics::default(),
             inotify: None,
             watches: HashMap::new(),
             paths: HashMap::new(),
@@ -77,6 +81,40 @@ impl ForegroundPolicy {
         self.inotify.as_ref().map(AsRawFd::as_raw_fd)
     }
 
+    pub fn check_prerequisites(&mut self, app_root: Option<&Path>) {
+        let capacity = self
+            .io
+            .read(&self.root.join("dmem.capacity"))
+            .and_then(|value| {
+                let values = parse_dmem_values(&value).map_err(io::Error::other)?;
+                if values.is_empty() {
+                    return Err(io::Error::other(
+                        "no device-memory regions reported by the driver",
+                    ));
+                }
+                Ok(())
+            });
+        if let Err(error) = capacity {
+            self.diagnostics.warn("capacity", format_args!(
+                "Cannot use {}/dmem.capacity: {error}; a working dmem controller and driver are required",
+                self.root.display()
+            ));
+        }
+        match app_root {
+            None => self.diagnostics.warn("app-root", format_args!(
+                "Cannot resolve app.slice through the systemd user manager; waiting for application cgroups"
+            )),
+            Some(path) => {
+                if let Err(error) = self.io.read(&path.join("dmem.low")) {
+                    self.diagnostics.warn("app-root", format_args!(
+                        "Cannot read {}/dmem.low: {error}; check the system and user dmemcg-booster services and ancestor controller setup",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+
     pub fn register(&mut self, cgroup: PathBuf) -> bool {
         if self.paths.contains_key(&cgroup) {
             return true;
@@ -84,21 +122,34 @@ impl ForegroundPolicy {
         if !self.pending_registration.insert(cgroup.clone()) {
             return false;
         }
-        if !self.eligible(&cgroup) {
+        if let Err(error) = self.eligible(&cgroup) {
+            self.diagnostics.warn("registration", format_args!(
+                "Cannot watch {}: {error}; retrying once per second. Check dmemcg-booster setup and cgroup permissions",
+                cgroup.display()
+            ));
             return false;
         }
         let Some(inotify) = &self.inotify else {
             return false;
         };
         let mask = WatchMask::ATTRIB | WatchMask::DELETE_SELF;
-        if let Ok(watch) = inotify.watches().add(&cgroup, mask) {
-            self.watches.insert(watch.clone(), cgroup.clone());
-            self.paths.insert(cgroup.clone(), watch);
-            self.pending_registration.remove(&cgroup);
-            self.pending_focus_checks.push(cgroup);
-            return true;
+        match inotify.watches().add(&cgroup, mask) {
+            Ok(watch) => {
+                debug(format_args!("Watching {}", cgroup.display()));
+                self.watches.insert(watch.clone(), cgroup.clone());
+                self.paths.insert(cgroup.clone(), watch);
+                self.pending_registration.remove(&cgroup);
+                self.pending_focus_checks.push(cgroup);
+                true
+            }
+            Err(error) => {
+                self.diagnostics.warn("watch", format_args!(
+                    "Cannot add inotify watch for {}: {error}; check permissions and fs.inotify.max_user_watches",
+                    cgroup.display()
+                ));
+                false
+            }
         }
-        false
     }
 
     pub fn untrack(&mut self, cgroup_path: &Path) {
@@ -257,18 +308,19 @@ impl ForegroundPolicy {
         }
     }
 
-    fn eligible(&self, path: &Path) -> bool {
+    fn eligible(&self, path: &Path) -> Result<(), String> {
         let low = path.join("dmem.low");
-        self.io
+        let value = self
+            .io
             .read(&low)
-            .and_then(|value| {
-                parse_dmem_values(&value)
-                    .map(drop)
-                    .map_err(io::Error::other)
-            })
-            .is_ok()
-            && self.io.xattrs_supported(path).is_ok()
-            && self.io.writable(&low).is_ok()
+            .map_err(|error| format!("cannot read dmem.low: {error}"))?;
+        parse_dmem_values(&value).map_err(|error| format!("invalid dmem.low: {error}"))?;
+        self.io
+            .xattrs_supported(path)
+            .map_err(|error| format!("cannot list user xattrs: {error}"))?;
+        self.io
+            .writable(&low)
+            .map_err(|error| format!("cannot write dmem.low: {error}"))
     }
 
     #[cfg(test)]
@@ -287,14 +339,36 @@ impl ForegroundPolicy {
             .map(|path| {
                 self.io
                     .get_xattr(&path, FOCUS_XATTR)
+                    .inspect_err(|error| {
+                        self.diagnostics.warn("focus-read", format_args!(
+                            "Cannot read {FOCUS_XATTR} on {}: {error}; deferring focus selection",
+                            path.display()
+                        ));
+                    })
                     .map(|value| (path, value))
             })
             .collect();
         let Ok(snapshot) = snapshot else {
             return false;
         };
+        if !snapshot.is_empty() && snapshot.iter().all(|(_, value)| value.is_none()) {
+            self.diagnostics.warn("focus-missing", format_args!(
+                "No tracked application cgroup has {FOCUS_XATTR}; waiting for window focus from a compatible Mutter session"
+            ));
+        }
         let mut changed = false;
         for (path, value) in snapshot {
+            if let Some(value) = &value
+                && let Err(error) = focus_is_active(value)
+            {
+                self.diagnostics.warn(
+                    "focus-invalid",
+                    format_args!(
+                        "Invalid {FOCUS_XATTR} on {}: {error}; this cgroup will not be selected",
+                        path.display()
+                    ),
+                );
+            }
             if self.focus_values.get(&path) != Some(&value) {
                 changed = true;
                 self.focus_values.insert(path, value);
@@ -320,6 +394,20 @@ impl ForegroundPolicy {
             HashSet::new()
         };
         let selected = (active.len() == 1).then(|| &active[0]);
+        if active.len() > 1 {
+            self.diagnostics.warn("focus-ambiguous", format_args!(
+                "{} application cgroups report active focus; waiting for an unambiguous selection",
+                active.len()
+            ));
+        }
+        if let Some(path) = selected {
+            debug(format_args!(
+                "Selected foreground cgroup {}",
+                path.display()
+            ));
+        } else {
+            debug(format_args!("No unique foreground cgroup selected"));
+        }
         for path in self.focus_values.keys().cloned().collect::<Vec<_>>() {
             if Some(&path) != selected {
                 self.pending_apply.remove(&path);
@@ -338,11 +426,16 @@ impl ForegroundPolicy {
 
     fn rebuild_watches(&mut self) {
         let paths: HashSet<_> = self.paths.keys().cloned().collect();
-        let Ok(inotify) = Inotify::init() else {
-            self.inotify = None;
-            self.watches.clear();
-            self.paths.clear();
-            return;
+        let inotify = match Inotify::init() {
+            Ok(inotify) => inotify,
+            Err(error) => {
+                self.diagnostics
+                    .warn("inotify", format_args!("{}", inotify_error(error)));
+                self.inotify = None;
+                self.watches.clear();
+                self.paths.clear();
+                return;
+            }
         };
         self.inotify = Some(inotify);
         self.watches.clear();
@@ -658,14 +751,24 @@ mod tests {
         io.0.borrow_mut()
             .xattrs
             .remove(&(app.clone(), FOCUS_XATTR.to_owned()));
-        assert!(policy.eligible(&app));
+        assert!(policy.eligible(&app).is_ok());
 
         io.0.borrow_mut().unwritable.insert(app.join("dmem.low"));
-        assert!(!policy.eligible(&app));
+        assert!(
+            policy
+                .eligible(&app)
+                .unwrap_err()
+                .contains("cannot write dmem.low")
+        );
 
         io.0.borrow_mut().unwritable.clear();
         io.0.borrow_mut().unsupported_xattrs.insert(app.clone());
-        assert!(!policy.eligible(&app));
+        assert!(
+            policy
+                .eligible(&app)
+                .unwrap_err()
+                .contains("cannot list user xattrs")
+        );
     }
 
     #[test]

@@ -239,8 +239,11 @@ class CompanionTests(unittest.TestCase):
 
     def foreground(self):
         process = self.launch(OPTIONS.foreground)
-        self.wait(lambda: any(self.user_bus.name_has_owner(sender) for sender in self.user_manager.subscribers),
-                  "foreground did not subscribe")
+        self.wait(lambda: self.user_bus.name_has_owner("org.gnome.ForegroundBooster"),
+                  "foreground did not acquire its service name")
+        owner = self.user_bus.get_name_owner("org.gnome.ForegroundBooster")
+        self.assertIn(owner, self.user_manager.subscribers,
+                      "service became ready before subscribing to systemd")
         return process
 
     def shims(self):
@@ -292,6 +295,35 @@ class CompanionTests(unittest.TestCase):
         self.assertEqual(self.low(self.a), 10)
         self.assertIsNone(self.state(self.a))
         self.assertEqual(self.low(self.app_root), CAPACITY)
+
+    def test_diagnostics_are_throttled_and_do_not_prevent_late_setup(self):
+        self.environment["GNOME_FOREGROUND_BOOSTER_DEBUG"] = "1"
+        foreground = self.foreground()
+        log = self.logs[-1]
+
+        def messages():
+            # Popen shares this file offset; reading must not move the writer's cursor.
+            return os.pread(log.fileno(), os.fstat(log.fileno()).st_size, 0).decode()
+
+        self.wait(lambda: "Cannot watch" in messages(), "missing registration diagnostic")
+        self.settle(2.2)
+        self.assertEqual(messages().count("Cannot watch"), 1,
+                         "registration retries flooded the log")
+        self.assertIn("dmemcg-booster setup", messages())
+        self.assertIsNone(foreground.poll())
+
+        # Malformed focus must be diagnosed without granting a boost.
+        os.setxattr(self.a, FOCUS, b"invalid")
+        self.shims()
+        self.wait(lambda: "Invalid user.xdg.inactive-since" in messages(),
+                  "missing invalid-focus diagnostic")
+        self.assertEqual(self.low(self.a), 10)
+        os.setxattr(self.a, FOCUS, b"-1")
+        self.wait(lambda: self.low(self.a) == CAPACITY, "late setup did not recover")
+        self.wait(lambda: "DEBUG: Boosted" in messages(), "missing boost debug log")
+        self.stop(foreground)
+        self.assertEqual(self.low(self.a), 10)
+        self.assertIn("DEBUG: Restored", messages())
 
     def test_foreground_first_and_new_application_hierarchy(self):
         foreground = self.foreground()
